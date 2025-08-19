@@ -3,27 +3,26 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Send, User, Bot, Menu, X, Sparkles } from "lucide-react";
 import AuthPanel from "./AuthPanel";
+import { supabase } from "../lib/supabase";
 
 /* ---------- Types ---------- */
 interface Message {
-  id: string;
+  id?: string;
   role: "user" | "assistant";
   content: string;
-  timestamp: string;
+  timestamp?: string;
   model?: string;
+  conversation_id?: string;
 }
+
 interface Conversation {
   id: string;
   title: string;
-  messages: Message[];
+  created_at?: string;
+  updated_at?: string;
 }
 
-/* ---------- Initial state ---------- */
-const startConversations: Conversation[] = [
-  { id: "1", title: "New Inquiry", messages: [] },
-];
-
-/* ---------- Message bubbles ---------- */
+/* ---------- UI atoms ---------- */
 function AIMessage({ message, isStreaming }: { message: Message; isStreaming?: boolean }) {
   return (
     <div className="flex gap-4 p-5 hover:bg-[#0f0f0f] transition-colors">
@@ -62,14 +61,14 @@ function UserMessage({ message }: { message: Message }) {
 /* ---------- Sidebar ---------- */
 function Sidebar({
   conversations,
-  activeConversation,
+  activeId,
   onSelectConversation,
   onNewChat,
   isOpen,
   onClose,
 }: {
   conversations: Conversation[];
-  activeConversation: Conversation | null;
+  activeId: string | null;
   onSelectConversation: (id: string) => void;
   onNewChat: () => void;
   isOpen: boolean;
@@ -105,26 +104,34 @@ function Sidebar({
           >
             New Inquiry
           </button>
+          <p className="text-[11px] text-amber-200/70 mt-2">
+            Tip: Sign in below to save and sync chats.
+          </p>
         </div>
 
         {/* list */}
         <div className="flex-1 overflow-y-auto px-3">
-          {conversations.map((c) => {
-            const active = activeConversation?.id === c.id;
-            return (
-              <button
-                key={c.id}
-                onClick={() => onSelectConversation(c.id)}
-                className={`w-full text-left p-3 rounded-lg mb-2 transition-colors ${
-                  active
-                    ? "bg-amber-500/10 border border-amber-500/30 text-amber-200"
-                    : "hover:bg-white/5 text-zinc-300 hover:text-white"
-                }`}
-              >
-                {c.title}
-              </button>
-            );
-          })}
+          {conversations.length === 0 ? (
+            <div className="text-zinc-400 text-sm px-2 py-4">No saved conversations yet.</div>
+          ) : (
+            conversations.map((c) => {
+              const active = activeId === c.id;
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => onSelectConversation(c.id)}
+                  className={`w-full text-left p-3 rounded-lg mb-2 transition-colors ${
+                    active
+                      ? "bg-amber-500/10 border border-amber-500/30 text-amber-200"
+                      : "hover:bg-white/5 text-zinc-300 hover:text-white"
+                  }`}
+                  title={c.title}
+                >
+                  {c.title}
+                </button>
+              );
+            })
+          )}
         </div>
 
         {/* auth */}
@@ -151,92 +158,249 @@ function ModelSelector({
         onChange={(e) => onModelChange(e.target.value)}
         className="w-full max-w-xs px-4 py-2 rounded-lg bg-[#101010] border border-amber-500/30 text-amber-200 placeholder-amber-200/60 focus:outline-none focus:ring-2 focus:ring-amber-400/50"
       >
-        <option value="gpt-4o" className="bg-[#101010]">
-          GPT-4o (OpenAI)
-        </option>
-        <option value="gpt-4o-mini" className="bg-[#101010]">
-          GPT-4o Mini (OpenAI)
-        </option>
-        <option value="claude-3-5-sonnet-20241022" className="bg-[#101010]">
-          Claude 3.5 Sonnet
-        </option>
-        <option value="claude-3-5-haiku-20241022" className="bg-[#101010]">
-          Claude 3.5 Haiku
-        </option>
+        <option value="gpt-4o" className="bg-[#101010]">GPT-4o (OpenAI)</option>
+        <option value="gpt-4o-mini" className="bg-[#101010]">GPT-4o Mini (OpenAI)</option>
+        <option value="claude-3-5-sonnet-20241022" className="bg-[#101010]">Claude 3.5 Sonnet</option>
+        <option value="claude-3-5-haiku-20241022" className="bg-[#101010]">Claude 3.5 Haiku</option>
       </select>
     </div>
   );
 }
 
-/* ---------- Main component ---------- */
+/* ---------- Main component (with Supabase persistence) ---------- */
 export default function AIChatApp() {
-  const [conversations, setConversations] = useState<Conversation[]>(startConversations);
-  const [activeConversation, setActiveConversation] = useState<Conversation | null>(
-    startConversations[0]
-  );
+  const [userId, setUserId] = useState<string | null>(null);
+
+  // Saved conversations for this user
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  // Messages of the active conversation
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  // Compose state
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [selectedModel, setSelectedModel] = useState("gpt-4o");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
   const endRef = useRef<HTMLDivElement>(null);
 
+  /* ---- auth + initial load ---- */
+  useEffect(() => {
+    // get current user
+    supabase.auth.getUser().then(({ data }) => {
+      const uid = data?.user?.id ?? null;
+      setUserId(uid);
+      if (uid) {
+        loadConversations(uid);
+      }
+    });
+    // subscribe to auth changes
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      const uid = session?.user?.id ?? null;
+      setUserId(uid);
+      if (uid) loadConversations(uid);
+      else {
+        setConversations([]);
+        setActiveId(null);
+        setMessages([]);
+      }
+    });
+    return () => {
+      // @ts-ignore (handle v1/v2 shapes)
+      sub?.subscription?.unsubscribe?.();
+      // @ts-ignore
+      sub?.unsubscribe?.();
+    };
+  }, []);
+
+  /* ---- auto-scroll ---- */
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeConversation?.messages]);
+  }, [messages, isLoading]);
+
+  /* ---- data loaders ---- */
+  async function loadConversations(uid: string) {
+    const { data, error } = await supabase
+      .from("conversations")
+      .select("id,title,created_at,updated_at")
+      .eq("user_id", uid)
+      .order("updated_at", { ascending: false });
+
+    if (!error && data) {
+      setConversations(data as Conversation[]);
+      // keep active if still present; otherwise select first
+      if (data.length) {
+        const stillExists = activeId && data.some((c) => c.id === activeId);
+        setActiveId(stillExists ? activeId : data[0].id);
+        if (!stillExists) loadMessages(data[0].id);
+      }
+    }
+  }
+
+  async function loadMessages(conversationId: string) {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("id,role,content,model,created_at,conversation_id")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+
+    if (!error && data) {
+      const mapped: Message[] = data.map((m) => ({
+        id: m.id,
+        role: m.role as "user" | "assistant",
+        content: m.content,
+        model: m.model ?? undefined,
+        timestamp: m.created_at ?? undefined,
+        conversation_id: m.conversation_id,
+      }));
+      setMessages(mapped);
+    }
+  }
+
+  /* ---- UI actions ---- */
+  async function newChat() {
+    // If signed in, create persisted conversation. If not, use ephemeral.
+    if (userId) {
+      const { data, error } = await supabase
+        .from("conversations")
+        .insert({ user_id: userId, title: "New Inquiry" })
+        .select("id,title,created_at,updated_at")
+        .single();
+
+      if (!error && data) {
+        setConversations((prev) => [data as Conversation, ...prev]);
+        setActiveId(data.id);
+        setMessages([]);
+      }
+    } else {
+      // Ephemeral only
+      const tempId = `local-${Date.now()}`;
+      const c: Conversation = { id: tempId, title: "New Inquiry" };
+      setConversations((prev) => [c, ...prev]);
+      setActiveId(tempId);
+      setMessages([]);
+    }
+    setSidebarOpen(false);
+  }
+
+  async function selectConversation(id: string) {
+    setActiveId(id);
+    if (userId && !id.startsWith("local-")) {
+      await loadMessages(id);
+    } else {
+      setMessages([]); // local, we don't keep multiple histories here
+    }
+    setSidebarOpen(false);
+  }
 
   async function sendMessage() {
-    if (!message.trim() || isLoading || !activeConversation) return;
+    if (!message.trim() || isLoading) return;
+
+    // If no conversation yet, create one quickly
+    let currentId = activeId;
+    if (!currentId) {
+      if (userId) {
+        const { data, error } = await supabase
+          .from("conversations")
+          .insert({ user_id: userId, title: "New Inquiry" })
+          .select("id,title")
+          .single();
+        if (error || !data) return;
+        currentId = data.id;
+        setConversations((prev) => [data as Conversation, ...prev]);
+        setActiveId(currentId);
+      } else {
+        currentId = `local-${Date.now()}`;
+        const c: Conversation = { id: currentId, title: "New Inquiry" };
+        setConversations((prev) => [c, ...prev]);
+        setActiveId(currentId);
+      }
+    }
 
     const userMsg: Message = {
-      id: Date.now().toString(),
       role: "user",
       content: message.trim(),
       timestamp: new Date().toISOString(),
+      model: selectedModel,
+      conversation_id: currentId,
     };
 
-    const updated: Conversation = {
-      ...activeConversation,
-      messages: [...activeConversation.messages, userMsg],
-    };
-    setActiveConversation(updated);
+    // Optimistic add
+    setMessages((prev) => [...prev, userMsg]);
     setMessage("");
     setIsLoading(true);
+
+    // Persist user message if signed in
+    if (userId && !currentId.startsWith("local-")) {
+      await supabase.from("messages").insert({
+        conversation_id: currentId,
+        role: "user",
+        content: userMsg.content,
+        model: selectedModel,
+      });
+      // set a first-title based on first message
+      const maybeTitle =
+        messages.length === 0 ? userMsg.content.slice(0, 30) + "..." : undefined;
+      await supabase
+        .from("conversations")
+        .update({ updated_at: new Date().toISOString(), ...(maybeTitle ? { title: maybeTitle } : {}) })
+        .eq("id", currentId);
+      // refresh list order
+      if (userId) loadConversations(userId);
+    }
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: updated.messages, model: selectedModel }),
+        body: JSON.stringify({
+          messages: [...messages, userMsg].map((m) => ({
+            id: m.id ?? "",
+            role: m.role,
+            content: m.content,
+            timestamp: m.timestamp ?? new Date().toISOString(),
+            model: m.model,
+          })),
+          model: selectedModel,
+        }),
       });
 
       if (!res.ok) throw new Error("Failed to get response");
       const data = await res.json();
 
       const aiMsg: Message = {
-        id: (Date.now() + 1).toString(),
         role: "assistant",
         content: data.content,
         timestamp: new Date().toISOString(),
         model: selectedModel,
+        conversation_id: currentId,
       };
 
-      const finalConv: Conversation = {
-        ...updated,
-        messages: [...updated.messages, aiMsg],
-        title:
-          updated.messages.length === 1 ? userMsg.content.slice(0, 30) + "..." : updated.title,
-      };
+      setMessages((prev) => [...prev, aiMsg]);
 
-      setActiveConversation(finalConv);
-      setConversations((prev) => prev.map((c) => (c.id === updated.id ? finalConv : c)));
-    } catch (e) {
-      const errMsg: Message = {
-        id: (Date.now() + 1).toString(),
+      // Persist assistant message if signed in
+      if (userId && !currentId.startsWith("local-")) {
+        await supabase.from("messages").insert({
+          conversation_id: currentId,
+          role: "assistant",
+          content: aiMsg.content,
+          model: selectedModel,
+        });
+        await supabase
+          .from("conversations")
+          .update({ updated_at: new Date().toISOString() })
+          .eq("id", currentId);
+        if (userId) loadConversations(userId);
+      }
+    } catch (_e) {
+      const err: Message = {
         role: "assistant",
         content: "I encountered an error. Please try again.",
         timestamp: new Date().toISOString(),
       };
-      setActiveConversation((prev) => (prev ? { ...prev, messages: [...prev.messages, errMsg] } : prev));
+      setMessages((prev) => [...prev, err]);
     } finally {
       setIsLoading(false);
     }
@@ -249,27 +413,16 @@ export default function AIChatApp() {
     }
   }
 
-  function newChat() {
-    const c: Conversation = { id: Date.now().toString(), title: "New Inquiry", messages: [] };
-    setConversations([c, ...conversations]);
-    setActiveConversation(c);
-    setSidebarOpen(false);
-  }
-
-  function selectConversation(id: string) {
-    const c = conversations.find((x) => x.id === id);
-    if (c) {
-      setActiveConversation(c);
-      setSidebarOpen(false);
-    }
-  }
+  /* ---------- Render ---------- */
+  const activeTitle =
+    conversations.find((c) => c.id === activeId)?.title ?? "New Inquiry";
 
   return (
     <div className="flex h-screen bg-[#0b0b0b] text-zinc-100">
       {/* sidebar */}
       <Sidebar
         conversations={conversations}
-        activeConversation={activeConversation}
+        activeId={activeId}
         onSelectConversation={selectConversation}
         onNewChat={newChat}
         isOpen={sidebarOpen}
@@ -293,7 +446,7 @@ export default function AIChatApp() {
             >
               <Menu size={20} className="text-amber-300" />
             </button>
-            <h1 className="text-xl font-bold">{activeConversation?.title || "New Inquiry"}</h1>
+            <h1 className="text-xl font-bold">{activeTitle}</h1>
           </div>
         </header>
 
@@ -301,18 +454,16 @@ export default function AIChatApp() {
 
         {/* chat area */}
         <div className="flex-1 overflow-y-auto">
-          {activeConversation?.messages.length ? (
+          {messages.length ? (
             <>
-              {activeConversation.messages.map((m) =>
-                m.role === "user" ? <UserMessage key={m.id} message={m} /> : <AIMessage key={m.id} message={m} />
+              {messages.map((m, idx) =>
+                m.role === "user" ? <UserMessage key={idx} message={m} /> : <AIMessage key={idx} message={m} />
               )}
               {isLoading && (
                 <AIMessage
                   message={{
-                    id: "loading",
                     role: "assistant",
                     content: "Consulting the archives...",
-                    timestamp: new Date().toISOString(),
                   }}
                   isStreaming
                 />
@@ -323,7 +474,6 @@ export default function AIChatApp() {
             <div className="h-full grid place-items-center">
               <div className="text-center max-w-xl mx-auto px-6">
                 <div className="w-24 h-24 mx-auto mb-6 rounded-full border border-amber-500/40 bg-amber-500/10 shadow-[0_0_40px_rgba(245,197,24,0.2)] overflow-hidden flex items-center justify-center">
-                  {/* your sigil (put file at /public/sigil.png) */}
                   <img src="/sigil.png" alt="Hierophant sigil" className="w-20 h-20 object-contain opacity-95" />
                 </div>
                 <h2 className="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-amber-300 to-yellow-500 mb-3">
@@ -332,6 +482,11 @@ export default function AIChatApp() {
                 <p className="text-zinc-300/90 leading-relaxed">
                   Your guide to the sacred mysteries of knowledge. What wisdom do you seek today?
                 </p>
+                {!userId && (
+                  <p className="text-amber-200/70 text-sm mt-3">
+                    Sign in (left panel) to save your inquiries.
+                  </p>
+                )}
               </div>
             </div>
           )}
